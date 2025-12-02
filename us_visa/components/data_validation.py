@@ -1,4 +1,4 @@
-import json
+import os
 import sys
 import pandas as pd
 
@@ -9,136 +9,116 @@ from pandas import DataFrame
 
 from us_visa.exception import USvisaException
 from us_visa.logger import logging
-from us_visa.utils.main_utils import read_yaml_file, write_yaml_file
-from us_visa.entity.artifact_entity import DataIngestionArtifact, DataValidationArtifact
 from us_visa.entity.config_entity import DataValidationConfig
-from us_visa.constants import SCHEMA_FILE_PATH
+from us_visa.entity.artifact_entity import DataIngestionArtifact, DataValidationArtifact
+from us_visa.utils.main_utils import read_yaml_file, write_yaml_file
+
+# ✅ New Evidently imports
+from evidently.report import Report
+from evidently.metric_preset import DataDriftPreset
 
 
 class DataValidation:
-    def __init__(self, data_ingestion_artifact: DataIngestionArtifact, data_validation_config: DataValidationConfig):
+    def __init__(self, data_ingestion_artifact: DataIngestionArtifact,
+                 data_validation_config: DataValidationConfig):
         """
-        :param data_ingestion_artifact: Output reference of data ingestion artifact stage
-        :param data_validation_config: configuration for data validation
+        Data Validation step:
+        - Loads train/test data
+        - Validates schema
+        - Detects data drift using Evidently
         """
         try:
             self.data_ingestion_artifact = data_ingestion_artifact
             self.data_validation_config = data_validation_config
-            self._schema_config = read_yaml_file(file_path=SCHEMA_FILE_PATH)
-        except Exception as e:
-            raise USvisaException(e, sys)
+            self.schema_config = read_yaml_file(data_validation_config.schema_file_path)
 
-    def validate_number_of_columns(self, dataframe: DataFrame) -> bool:
-        """Validates the number of columns"""
-        try:
-            status = len(dataframe.columns) == len(self._schema_config["columns"])
-            logging.info(f"Is required column present: [{status}]")
-            return status
-        except Exception as e:
-            raise USvisaException(e, sys)
-
-    def is_column_exist(self, df: DataFrame) -> bool:
-        """Validates the existence of numerical and categorical columns"""
-        try:
-            dataframe_columns = df.columns
-            missing_numerical_columns = []
-            missing_categorical_columns = []
-
-            for column in self._schema_config["numerical_columns"]:
-                if column not in dataframe_columns:
-                    missing_numerical_columns.append(column)
-
-            if missing_numerical_columns:
-                logging.info(f"Missing numerical column: {missing_numerical_columns}")
-
-            for column in self._schema_config["categorical_columns"]:
-                if column not in dataframe_columns:
-                    missing_categorical_columns.append(column)
-
-            if missing_categorical_columns:
-                logging.info(f"Missing categorical column: {missing_categorical_columns}")
-
-            return not (missing_numerical_columns or missing_categorical_columns)
         except Exception as e:
             raise USvisaException(e, sys) from e
 
-    @staticmethod
-    def read_data(file_path) -> DataFrame:
-        """Reads CSV data into DataFrame"""
+    def validate_schema(self, df: pd.DataFrame) -> bool:
+        """
+        Validate dataset schema (column names & count).
+        """
         try:
-            return pd.read_csv(file_path)
+            expected_columns = list(self.schema_config["columns"].keys())
+            actual_columns = list(df.columns)
+
+            if expected_columns != actual_columns:
+                logging.error(f"Schema mismatch! Expected: {expected_columns}, Got: {actual_columns}")
+                return False
+
+            logging.info("Schema validation successful ✅")
+            return True
+
         except Exception as e:
-            raise USvisaException(e, sys)
+            raise USvisaException(e, sys) from e
 
-    def detect_dataset_drift(self, reference_df: DataFrame, current_df: DataFrame) -> bool:
-        """Detects dataset drift using Evidently Report API"""
+    def detect_dataset_drift(self, reference_df: pd.DataFrame, current_df: pd.DataFrame) -> bool:
+        """
+        Detect dataset drift between reference (train) and current (test) datasets.
+        Uses Evidently Report with DataDriftPreset.
+        """
         try:
-            # Generate drift report
-            data_drift_report = Report(metrics=[DataDriftPreset()])
-            data_drift_report.run(reference_data=reference_df, current_data=current_df)
+            # ✅ Create Evidently Report
+            drift_report = Report(metrics=[DataDriftPreset()])
+            drift_report.run(reference_data=reference_df, current_data=current_df)
 
-            # Convert report to dict
-            json_report = data_drift_report.as_dict()
+            # ✅ Convert to dictionary
+            report_dict = drift_report.as_dict()
 
-            # Save as YAML
+            # ✅ Save drift report in YAML
             write_yaml_file(
                 file_path=self.data_validation_config.drift_report_file_path,
-                content=json_report
+                content=report_dict
             )
 
-            # Extract metrics
-            n_features = json_report["metrics"][0]["result"]["number_of_features"]
-            n_drifted_features = json_report["metrics"][0]["result"]["number_of_drifted_features"]
+            # ✅ Extract drift results
+            drift_result = report_dict["metrics"][0]["result"]
+            drift_status = drift_result["dataset_drift"]  # True/False
+            drift_by_columns = drift_result["drift_by_columns"]
 
-            logging.info(f"{n_drifted_features}/{n_features} features show drift.")
+            n_features = len(drift_by_columns)
+            n_drifted = sum(drift_by_columns.values())
 
-            drift_status = json_report["metrics"][0]["result"]["dataset_drift"]
+            logging.info(f"Drift detected in {n_drifted}/{n_features} features.")
+
             return drift_status
+
         except Exception as e:
             raise USvisaException(e, sys) from e
 
     def initiate_data_validation(self) -> DataValidationArtifact:
-        """Runs all data validation steps"""
+        """
+        Main entry point:
+        - Loads train/test
+        - Validates schema
+        - Runs data drift check
+        - Returns DataValidationArtifact
+        """
         try:
-            validation_error_msg = ""
-            logging.info("Starting data validation")
+            # ✅ Load train/test data
+            train_df = pd.read_csv(self.data_ingestion_artifact.train_file_path)
+            test_df = pd.read_csv(self.data_ingestion_artifact.test_file_path)
 
-            train_df, test_df = (
-                DataValidation.read_data(file_path=self.data_ingestion_artifact.trained_file_path),
-                DataValidation.read_data(file_path=self.data_ingestion_artifact.test_file_path)
-            )
+            # ✅ Schema validation
+            is_train_valid = self.validate_schema(train_df)
+            is_test_valid = self.validate_schema(test_df)
 
-            # Column count check
-            if not self.validate_number_of_columns(dataframe=train_df):
-                validation_error_msg += "Columns are missing in training dataframe. "
-            if not self.validate_number_of_columns(dataframe=test_df):
-                validation_error_msg += "Columns are missing in test dataframe. "
+            if not (is_train_valid and is_test_valid):
+                raise USvisaException("Schema validation failed ❌", sys)
 
-            # Schema column check
-            if not self.is_column_exist(df=train_df):
-                validation_error_msg += "Required columns are missing in training dataframe. "
-            if not self.is_column_exist(df=test_df):
-                validation_error_msg += "Required columns are missing in test dataframe. "
+            # ✅ Data drift detection
+            drift_status = self.detect_dataset_drift(train_df, test_df)
 
-            validation_status = len(validation_error_msg) == 0
-
-            if validation_status:
-                drift_status = self.detect_dataset_drift(train_df, test_df)
-                if drift_status:
-                    logging.info("Drift detected.")
-                    validation_error_msg = "Drift detected"
-                else:
-                    validation_error_msg = "Drift not detected"
-            else:
-                logging.info(f"Validation_error: {validation_error_msg}")
-
+            # ✅ Create validation artifact
             data_validation_artifact = DataValidationArtifact(
-                validation_status=validation_status,
-                message=validation_error_msg,
-                drift_report_file_path=self.data_validation_config.drift_report_file_path
+                schema_file_path=self.data_validation_config.schema_file_path,
+                drift_report_file_path=self.data_validation_config.drift_report_file_path,
+                validation_status=True,
+                message="Data validation completed successfully ✅"
             )
 
-            logging.info(f"Data validation artifact: {data_validation_artifact}")
+            logging.info(f"Data Validation Artifact: {data_validation_artifact}")
             return data_validation_artifact
 
         except Exception as e:
